@@ -1,0 +1,161 @@
+import express from 'express';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import path from 'path';
+import fs from 'fs';
+import { fileURLToPath } from 'url';
+import crypto from 'crypto';
+
+const execAsync = promisify(exec);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const app = express();
+app.use(express.json());
+
+const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
+if (!fs.existsSync(DOWNLOADS_DIR)) fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
+
+// Serve built React frontend
+app.use(express.static(path.join(__dirname, 'frontend', 'dist')));
+
+// ─── Search YouTube ────────────────────────────────────────────────────────────
+app.get('/api/search', async (req, res) => {
+  const { q } = req.query;
+  if (!q) return res.status(400).json({ error: 'Query required' });
+
+  try {
+    const { stdout } = await execAsync(
+      `yt-dlp "ytsearch12:${q.replace(/"/g, '')}" --dump-json --no-download --flat-playlist`,
+      { timeout: 30000 }
+    );
+
+    const results = stdout
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map(line => {
+        try {
+          const d = JSON.parse(line);
+          return {
+            id: d.id,
+            title: d.title,
+            duration: d.duration,
+            channel: d.channel || d.uploader || 'Unknown',
+            thumbnail: d.thumbnail || `https://i.ytimg.com/vi/${d.id}/mqdefault.jpg`,
+          };
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+
+    res.json(results);
+  } catch (err) {
+    console.error('Search error:', err.message);
+    res.status(500).json({ error: 'Search failed. Make sure yt-dlp is installed.' });
+  }
+});
+
+// ─── Download song → store as MP3 ─────────────────────────────────────────────
+app.post('/api/download', async (req, res) => {
+  const { videoId, title, thumbnail, channel, duration } = req.body;
+  if (!videoId) return res.status(400).json({ error: 'videoId required' });
+
+  // Check if already downloaded
+  const existing = getLibrary().find(s => s.videoId === videoId);
+  if (existing) return res.json({ success: true, song: existing, cached: true });
+
+  const songId = crypto.randomUUID();
+  const outputTemplate = path.join(DOWNLOADS_DIR, `${songId}.%(ext)s`);
+  const mp3Path = path.join(DOWNLOADS_DIR, `${songId}.mp3`);
+  const metaPath = path.join(DOWNLOADS_DIR, `${songId}.json`);
+
+  try {
+    await execAsync(
+      `yt-dlp -x --audio-format mp3 --audio-quality 0 --no-playlist -o "${outputTemplate}" "https://www.youtube.com/watch?v=${videoId}"`,
+      { timeout: 180000 }
+    );
+
+    const meta = {
+      id: songId,
+      videoId,
+      title: title || 'Unknown',
+      thumbnail: thumbnail || `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
+      channel: channel || 'Unknown',
+      duration: duration || 0,
+      addedAt: Date.now(),
+    };
+    fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+
+    res.json({ success: true, song: meta });
+  } catch (err) {
+    console.error('Download error:', err.message);
+    [mp3Path, metaPath].forEach(f => { try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch {} });
+    res.status(500).json({ error: 'Download failed: ' + err.message });
+  }
+});
+
+// ─── List library ──────────────────────────────────────────────────────────────
+app.get('/api/songs', (req, res) => {
+  res.json(getLibrary());
+});
+
+// ─── Stream MP3 (with range support) ──────────────────────────────────────────
+app.get('/api/stream/:id', (req, res) => {
+  const songPath = path.join(DOWNLOADS_DIR, `${req.params.id}.mp3`);
+  if (!fs.existsSync(songPath)) return res.status(404).json({ error: 'Not found' });
+
+  const stat = fs.statSync(songPath);
+  const range = req.headers.range;
+
+  if (range) {
+    const [startStr, endStr] = range.replace(/bytes=/, '').split('-');
+    const start = parseInt(startStr, 10);
+    const end = endStr ? parseInt(endStr, 10) : stat.size - 1;
+    res.writeHead(206, {
+      'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': end - start + 1,
+      'Content-Type': 'audio/mpeg',
+    });
+    fs.createReadStream(songPath, { start, end }).pipe(res);
+  } else {
+    res.writeHead(200, { 'Content-Length': stat.size, 'Content-Type': 'audio/mpeg', 'Accept-Ranges': 'bytes' });
+    fs.createReadStream(songPath).pipe(res);
+  }
+});
+
+// ─── Delete from library ───────────────────────────────────────────────────────
+app.delete('/api/songs/:id', (req, res) => {
+  const id = req.params.id;
+  ['.mp3', '.json'].forEach(ext => {
+    const f = path.join(DOWNLOADS_DIR, `${id}${ext}`);
+    try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch {}
+  });
+  res.json({ success: true });
+});
+
+// ─── Helpers ───────────────────────────────────────────────────────────────────
+function getLibrary() {
+  try {
+    return fs
+      .readdirSync(DOWNLOADS_DIR)
+      .filter(f => f.endsWith('.json'))
+      .map(f => {
+        try { return JSON.parse(fs.readFileSync(path.join(DOWNLOADS_DIR, f), 'utf-8')); }
+        catch { return null; }
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.addedAt - a.addedAt);
+  } catch {
+    return [];
+  }
+}
+
+// ─── Fallback → React SPA ─────────────────────────────────────────────────────
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'frontend', 'dist', 'index.html'));
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🎵 Music server on http://localhost:${PORT}`));
