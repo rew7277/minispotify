@@ -17,11 +17,22 @@ const COOKIES_PATH  = path.join(DOWNLOADS_DIR, 'cookies.txt');
 
 if (!fs.existsSync(DOWNLOADS_DIR)) fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 
+// ─── Boot: sync YOUTUBE_COOKIES env var → cookies.txt ─────────────────────────
+// Railway env vars are the preferred way to set cookies (survives redeploys).
+// If the env var is set, always write it to the file so yt-dlp can use it.
+const ENV_COOKIES = process.env.YOUTUBE_COOKIES;
+if (ENV_COOKIES && ENV_COOKIES.length > 100) {
+  fs.writeFileSync(COOKIES_PATH, ENV_COOKIES, 'utf-8');
+  console.log('✅ Loaded YouTube cookies from YOUTUBE_COOKIES env var');
+}
+
 // Serve built React frontend
 app.use(express.static(path.join(__dirname, 'frontend', 'dist')));
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function hasCookies() {
+  // Also treat env var as "has cookies" even before first write
+  if (ENV_COOKIES && ENV_COOKIES.length > 100) return true;
   return fs.existsSync(COOKIES_PATH) && fs.statSync(COOKIES_PATH).size > 100;
 }
 
